@@ -4,7 +4,6 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
 
 /// Multi-step caregiver sign up with image picking + Firebase Storage uploads.
 class CaregiverSignUpPage extends StatefulWidget {
@@ -26,14 +25,14 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
   final _password = TextEditingController();
   final _confirm = TextEditingController();
 
-  // Step 2 (attachments) — store XFiles and later upload them
+  // Step 2 (attachments)
   final _f2 = GlobalKey<FormState>();
   final _ratePerHour = TextEditingController();
   final _picker = ImagePicker();
-  final List<XFile> _certFiles = [];      // max 3
-  final List<XFile> _dlFiles = [];        // max 3
-  final List<XFile> _icFiles = [];        // max 3
-  XFile? _profileFile;                    // single
+  final List<XFile> _certFiles = []; // max 3
+  final List<XFile> _dlFiles = [];   // max 3
+  final List<XFile> _icFiles = [];   // max 3
+  XFile? _profileFile;               // single
 
   // Step 3
   final _f3 = GlobalKey<FormState>();
@@ -43,6 +42,7 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
   String? _gender;
 
   final _days = const ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+
   final Map<String, bool> _dayOn = {
     'Monday': false, 'Tuesday': false, 'Wednesday': false, 'Thursday': false,
     'Friday': false, 'Saturday': false, 'Sunday': false,
@@ -85,13 +85,23 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
   }
 
   Future<void> _pickStart(String day) async {
-    final res = await showTimePicker(context: context, initialTime: _start[day] ?? const TimeOfDay(hour: 9, minute: 0));
+    final res = await showTimePicker(
+      context: context,
+      initialTime: _start[day] ?? const TimeOfDay(hour: 9, minute: 0),
+    );
     if (res != null) setState(() => _start[day] = res);
   }
 
   Future<void> _pickEnd(String day) async {
-    final res = await showTimePicker(context: context, initialTime: _end[day] ?? const TimeOfDay(hour: 17, minute: 0));
+    final res = await showTimePicker(
+      context: context,
+      initialTime: _end[day] ?? const TimeOfDay(hour: 17, minute: 0),
+    );
     if (res != null) setState(() => _end[day] = res);
+  }
+
+  void _toggleDay(String day, bool value) {
+    setState(() => _dayOn[day] = value);
   }
 
   /* --------------------------- Image pickers --------------------------- */
@@ -100,11 +110,8 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
       _toast('Maximum $max files reached.');
       return;
     }
-    // pickMultiImage works on mobile & web; allow selecting multiple at once
     final imgs = await _picker.pickMultiImage(imageQuality: 85);
     if (imgs.isEmpty) return;
-
-    // Respect max
     final remaining = max - list.length;
     setState(() => list.addAll(imgs.take(remaining)));
   }
@@ -118,7 +125,7 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
   Future<void> _submit() async {
     if (!(_f3.currentState?.validate() ?? false)) return;
 
-    // Validate availability
+    // Validate availability for checked days
     for (final d in _days) {
       if (_dayOn[d] == true && (_start[d] == null || _end[d] == null)) {
         _toast('Please set start & end time for $d');
@@ -127,15 +134,27 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
     }
 
     setState(() => _busy = true);
+    UserCredential? cred;
+
     try {
       // 1) Create Auth user
-      final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+      cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
         email: _email.text.trim(),
         password: _password.text,
       );
       final uid = cred.user!.uid;
 
-      // 2) Upload all picked images -> get download URLs
+      // 2) Write basic user doc so you can see it under `users` (role = caregiver)
+      final usersRef = FirebaseFirestore.instance.collection('users').doc(uid);
+      await usersRef.set({
+        'username': _fullName.text.trim(),
+        'email': _email.text.trim(),
+        'contact': _contact.text.trim(),
+        'role': 'caregiver',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      // 3) Upload images
       final storage = FirebaseStorage.instance;
       final certUrls = await _uploadFiles(storage, uid, 'certificates', _certFiles);
       final dlUrls   = await _uploadFiles(storage, uid, 'driving_licenses', _dlFiles);
@@ -145,7 +164,7 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
         profileUrl = await _uploadOne(storage, uid, 'profile', _profileFile!);
       }
 
-      // 3) Availability map
+      // 4) Availability map (HH:mm)
       final df = DateFormat('HH:mm');
       final availability = <String, dynamic>{};
       for (final d in _days) {
@@ -154,12 +173,12 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
           final en = _end[d]!;
           availability[d] = {
             'start': df.format(DateTime(0, 1, 1, st.hour, st.minute)),
-            'end': df.format(DateTime(0, 1, 1, en.hour, en.minute)),
+            'end' : df.format(DateTime(0, 1, 1, en.hour, en.minute)),
           };
         }
       }
 
-      // 4) Firestore doc
+      // 5) Write full caregiver profile
       await FirebaseFirestore.instance.collection('caregivers').doc(uid).set({
         'fullName': _fullName.text.trim(),
         'email': _email.text.trim(),
@@ -186,7 +205,11 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
     } on FirebaseAuthException catch (e) {
       _toast(e.message ?? 'Authentication error');
     } catch (e) {
-      _toast('Error: $e');
+      // If anything after auth failed, roll back the auth user to avoid orphaned accounts
+      try {
+        await cred?.user?.delete();
+      } catch (_) {}
+      _toast('Failed to save caregiver profile: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -214,12 +237,9 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
       ) async {
     final filename = '${DateTime.now().millisecondsSinceEpoch}_${file.name}';
     final ref = storage.ref().child('caregivers/$uid/$folder/$filename');
-
-    // Use bytes for both web and mobile to avoid dart:io
     final bytes = await file.readAsBytes();
-    final metadata = SettableMetadata(contentType: 'image/jpeg'); // good default
-    final task = ref.putData(bytes, metadata);
-    final snap = await task;
+    final metadata = SettableMetadata(contentType: 'image/jpeg');
+    final snap = await ref.putData(bytes, metadata);
     return await snap.ref.getDownloadURL();
   }
 
@@ -246,7 +266,14 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
                 controller: _pager,
                 physics: const NeverScrollableScrollPhysics(),
                 children: [
-                  _Step1Basic(formKey: _f1, fullName: _fullName, email: _email, contact: _contact, password: _password, confirm: _confirm),
+                  _Step1Basic(
+                    formKey: _f1,
+                    fullName: _fullName,
+                    email: _email,
+                    contact: _contact,
+                    password: _password,
+                    confirm: _confirm,
+                  ),
                   _Step2Attachments(
                     formKey: _f2,
                     ratePerHour: _ratePerHour,
@@ -271,6 +298,7 @@ class _CaregiverSignUpPageState extends State<CaregiverSignUpPage> {
                     gender: _gender, onGender: (v) => setState(() => _gender = v),
                     dayOn: _dayOn, start: _start, end: _end,
                     pickStart: _pickStart, pickEnd: _pickEnd,
+                    onToggleDay: _toggleDay, // instant enable/disable
                   ),
                 ],
               ),
@@ -332,16 +360,28 @@ class _Step1Basic extends StatelessWidget {
           child: Column(children: [
             TextFormField(controller: fullName, decoration: const InputDecoration(labelText: 'Full Name'), validator: _req),
             const SizedBox(height: 12),
-            TextFormField(controller: email, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Email Address'),
-                validator: (v) => (v == null || !v.contains('@')) ? 'Enter a valid email' : null),
+            TextFormField(
+              controller: email,
+              keyboardType: TextInputType.emailAddress,
+              decoration: const InputDecoration(labelText: 'Email Address'),
+              validator: (v) => (v == null || !v.contains('@')) ? 'Enter a valid email' : null,
+            ),
             const SizedBox(height: 12),
             TextFormField(controller: contact, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Contact Number'), validator: _req),
             const SizedBox(height: 12),
-            TextFormField(controller: password, obscureText: true, decoration: const InputDecoration(labelText: 'Password'),
-                validator: (v) => (v == null || v.length < 6) ? 'Min 6 characters' : null),
+            TextFormField(
+              controller: password,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'Password'),
+              validator: (v) => (v == null || v.length < 6) ? 'Min 6 characters' : null,
+            ),
             const SizedBox(height: 12),
-            TextFormField(controller: confirm, obscureText: true, decoration: const InputDecoration(labelText: 'Confirm Password'),
-                validator: (v) => (v == password.text) ? null : 'Passwords do not match'),
+            TextFormField(
+              controller: confirm,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'Confirm Password'),
+              validator: (v) => (v == password.text) ? null : 'Passwords do not match',
+            ),
           ]),
         ),
       ],
@@ -499,6 +539,7 @@ class _Step3Details extends StatelessWidget {
   final Map<String, bool> dayOn;
   final Map<String, TimeOfDay?> start, end;
   final Future<void> Function(String) pickStart, pickEnd;
+  final void Function(String day, bool value) onToggleDay; // new
 
   const _Step3Details({
     required this.formKey,
@@ -508,6 +549,7 @@ class _Step3Details extends StatelessWidget {
     required this.gender, required this.onGender,
     required this.dayOn, required this.start, required this.end,
     required this.pickStart, required this.pickEnd,
+    required this.onToggleDay,
   });
 
   @override
@@ -572,7 +614,10 @@ class _Step3Details extends StatelessWidget {
           ]),
         ),
         const SizedBox(height: 6),
-        Text('Select Available Schedule:', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+        Text(
+          'Select Available Schedule:',
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
         const SizedBox(height: 8),
         ...days.map((d) => Padding(
           padding: const EdgeInsets.only(bottom: 8),
@@ -580,16 +625,27 @@ class _Step3Details extends StatelessWidget {
             SizedBox(
               width: 110,
               child: Row(children: [
-                Checkbox(value: dayOn[d] ?? false, onChanged: (v) => dayOn[d] = v ?? false),
+                Checkbox(
+                  value: dayOn[d] ?? false,
+                  onChanged: (v) => onToggleDay(d, v ?? false), // instant enable
+                ),
                 Flexible(child: Text(d)),
               ]),
             ),
             const SizedBox(width: 8),
-            Expanded(child: OutlinedButton(onPressed: (dayOn[d] ?? false) ? () => pickStart(d) : null,
-                child: Text(start[d] == null ? 'Start Time' : start[d]!.format(context)))),
+            Expanded(
+              child: OutlinedButton(
+                onPressed: (dayOn[d] ?? false) ? () => pickStart(d) : null,
+                child: Text(start[d] == null ? 'Start Time' : start[d]!.format(context)),
+              ),
+            ),
             const SizedBox(width: 8),
-            Expanded(child: OutlinedButton(onPressed: (dayOn[d] ?? false) ? () => pickEnd(d) : null,
-                child: Text(end[d] == null ? 'End Time' : end[d]!.format(context)))),
+            Expanded(
+              child: OutlinedButton(
+                onPressed: (dayOn[d] ?? false) ? () => pickEnd(d) : null,
+                child: Text(end[d] == null ? 'End Time' : end[d]!.format(context)),
+              ),
+            ),
           ]),
         )),
       ],
@@ -601,6 +657,7 @@ class _HeaderLabel extends StatelessWidget {
   final String text;
   const _HeaderLabel(this.text);
   @override
-  Widget build(BuildContext context) => Text(text, textAlign: TextAlign.center,
-      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700));
+  Widget build(BuildContext context) =>
+      Text(text, textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700));
 }
